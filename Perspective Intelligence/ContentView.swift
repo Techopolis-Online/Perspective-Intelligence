@@ -7,18 +7,15 @@
 
 import SwiftUI
 
-struct ContentView: View {
+// Placeholder file preserved in case other references exist.
+// Main chat UI is in ChatView.swift
+
+struct PlaceholderContentView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+        ChatView()
     }
 }
 
 #Preview {
-    ContentView()
+    PlaceholderContentView()
 }

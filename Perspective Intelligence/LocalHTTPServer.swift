@@ -423,7 +423,14 @@ actor LocalHTTPServer {
                 let req = try decoder.decode(ChatCompletionRequest.self, from: request.bodyData)
                 if req.stream == true {
                     return .stream(HTTPStreamResponse.sse(handler: { emitter in
-                        let useMulti = (req.multi_segment ?? true) == true
+                        // If tools are present in the request, route through single response path (no multi-segment)
+                        let hasTools: Bool = {
+                            if let data = String(data: request.bodyData, encoding: .utf8)?.lowercased() {
+                                return data.contains("\"tools\"") && !data.contains("\"tools\": []")
+                            }
+                            return false
+                        }()
+                        let useMulti = (!hasTools) && ((req.multi_segment ?? true) == true)
                         if useMulti {
                             // Stream multi-segment output piecewise
                             let streamId = "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")

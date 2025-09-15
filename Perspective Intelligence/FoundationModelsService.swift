@@ -62,6 +62,9 @@ struct ChatCompletionRequest: Codable {
     let max_tokens: Int?
     let stream: Bool?
     let multi_segment: Bool?
+    // OpenAI-style tools support (optional)
+    let tools: [OAITool]?
+    let tool_choice: ToolChoice?
 }
 
 // Content part per OpenAI structured content. We only use text; non-text parts are ignored.
@@ -85,6 +88,114 @@ struct ChatCompletionResponse: Codable {
     let created: Int
     let model: String
     let choices: [Choice]
+}
+
+// MARK: - OpenAI Tools Types
+
+struct OAITool: Codable {
+    let type: String // expecting "function"
+    let function: OAIFunction?
+}
+
+struct OAIFunction: Codable {
+    let name: String
+    let description: String?
+    let parameters: JSONValue? // arbitrary JSON schema, not used by executor
+}
+
+enum ToolChoice: Codable {
+    case none
+    case auto
+    case required
+    case function(name: String)
+
+    init(from decoder: Decoder) throws {
+        if let s = try? decoder.singleValueContainer().decode(String.self) {
+            switch s {
+            case "none": self = .none
+            case "auto": self = .auto
+            case "required": self = .required
+            default: self = .auto
+            }
+            return
+        }
+        struct FuncWrap: Codable { let type: String?; let function: Func? }
+        struct Func: Codable { let name: String }
+        if let f = try? decoder.singleValueContainer().decode(FuncWrap.self), let name = f.function?.name {
+            self = .function(name: name)
+            return
+        }
+        self = .auto
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case .none: var c = encoder.singleValueContainer(); try c.encode("none")
+        case .auto: var c = encoder.singleValueContainer(); try c.encode("auto")
+        case .required: var c = encoder.singleValueContainer(); try c.encode("required")
+        case .function(let name):
+            struct Wrapper: Codable { let type: String; let function: Inner }
+            struct Inner: Codable { let name: String }
+            var c = encoder.singleValueContainer()
+            try c.encode(Wrapper(type: "function", function: Inner(name: name)))
+        }
+    }
+}
+
+// A minimal JSON value tree for decoding arbitrary tool parameter shapes
+enum JSONValue: Codable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null; return }
+        if let b = try? c.decode(Bool.self) { self = .bool(b); return }
+        if let d = try? c.decode(Double.self) { self = .number(d); return }
+        if let s = try? c.decode(String.self) { self = .string(s); return }
+        if let o = try? decoder.container(keyedBy: DynamicCodingKeys.self) {
+            var dict: [String: JSONValue] = [:]
+            for key in o.allKeys {
+                let v = try o.decode(JSONValue.self, forKey: key)
+                dict[key.stringValue] = v
+            }
+            self = .object(dict)
+            return
+        }
+        if var a = try? decoder.unkeyedContainer() {
+            var arr: [JSONValue] = []
+            while !a.isAtEnd { arr.append(try a.decode(JSONValue.self)) }
+            self = .array(arr)
+            return
+        }
+        self = .null
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case .string(let s): var c = encoder.singleValueContainer(); try c.encode(s)
+        case .number(let d): var c = encoder.singleValueContainer(); try c.encode(d)
+        case .bool(let b): var c = encoder.singleValueContainer(); try c.encode(b)
+        case .null: var c = encoder.singleValueContainer(); try c.encodeNil()
+        case .object(let dict):
+            var o = encoder.container(keyedBy: DynamicCodingKeys.self)
+            for (k,v) in dict { try o.encode(v, forKey: DynamicCodingKeys(stringValue: k)!) }
+        case .array(let arr):
+            var a = encoder.unkeyedContainer()
+            for v in arr { try a.encode(v) }
+        }
+    }
+}
+
+struct DynamicCodingKeys: CodingKey {
+    var stringValue: String
+    init?(stringValue: String) { self.stringValue = stringValue }
+    var intValue: Int? { nil }
+    init?(intValue: Int) { return nil }
 }
 
 // MARK: - OpenAI-Compatible Text Completions
@@ -155,6 +266,11 @@ final class FoundationModelsService: @unchecked Sendable {
 
     /// Handles an OpenAI-compatible chat completion request and returns a response.
     func handleChatCompletion(_ request: ChatCompletionRequest) async throws -> ChatCompletionResponse {
+        // If tools are provided, run the tool-calling orchestration flow.
+        if let tools = request.tools, !tools.isEmpty {
+            return try await handleChatCompletionWithTools(request, tools: tools)
+        }
+
         // Build a context-aware prompt that fits within the model's context by summarizing older content when needed.
         let prompt = await prepareChatPrompt(messages: request.messages, model: request.model, temperature: request.temperature, maxTokens: request.max_tokens)
         logger.log("[chat] model=\(request.model, privacy: .public) messages=\(request.messages.count) promptLen=\(prompt.count)")
@@ -177,6 +293,51 @@ final class FoundationModelsService: @unchecked Sendable {
             ]
         )
         return response
+    }
+
+    /// Tool-calling orchestration: prompt for a tool call, execute it, then get the final answer.
+    private func handleChatCompletionWithTools(_ request: ChatCompletionRequest, tools: [OAITool]) async throws -> ChatCompletionResponse {
+        // Build an augmented system instruction describing available tools and the exact JSON contract.
+        let toolIntro = toolsDescription(tools)
+        var msgs: [ChatCompletionRequest.Message] = []
+        msgs.append(.init(role: "system", content: toolIntro))
+        msgs.append(contentsOf: request.messages)
+
+        // First round: ask the model if it wants to call a tool; if so, it must reply ONLY with the JSON envelope.
+        let prompt1 = await prepareChatPrompt(messages: msgs, model: request.model, temperature: request.temperature, maxTokens: request.max_tokens)
+        let out1 = try await generateText(model: request.model, prompt: prompt1, temperature: request.temperature, maxTokens: request.max_tokens)
+        logger.log("[tools] first-round len=\(out1.count)")
+
+        if let call = parseToolCall(from: out1) {
+            // Execute tool
+            let result = try await ToolsRegistry.shared.execute(name: call.name, arguments: call.arguments)
+            let resultText = jsonString(result) ?? String(describing: result)
+            // Append tool call and tool result, then ask for the final answer.
+            msgs.append(.init(role: "assistant", content: out1))
+            msgs.append(.init(role: "tool", content: resultText))
+            let prompt2 = await prepareChatPrompt(messages: msgs, model: request.model, temperature: request.temperature, maxTokens: request.max_tokens)
+            let out2 = try await generateText(model: request.model, prompt: prompt2, temperature: request.temperature, maxTokens: request.max_tokens)
+            return ChatCompletionResponse(
+                id: "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: ""),
+                object: "chat.completion",
+                created: Int(Date().timeIntervalSince1970),
+                model: request.model,
+                choices: [
+                    .init(index: 0, message: .init(role: "assistant", content: out2), finish_reason: "stop")
+                ]
+            )
+        } else {
+            // No tool call requested; treat out1 as the final answer.
+            return ChatCompletionResponse(
+                id: "chatcmpl_" + UUID().uuidString.replacingOccurrences(of: "-", with: ""),
+                object: "chat.completion",
+                created: Int(Date().timeIntervalSince1970),
+                model: request.model,
+                choices: [
+                    .init(index: 0, message: .init(role: "assistant", content: out1), finish_reason: "stop")
+                ]
+            )
+        }
     }
 
     // MARK: - Context management for Chat
@@ -321,7 +482,7 @@ final class FoundationModelsService: @unchecked Sendable {
         let maxTokens = request.options?.num_predict
         // Reuse our chat completion pipeline by mapping roles/content
         let mapped = request.messages.map { ChatCompletionRequest.Message(role: $0.role, content: $0.content) }
-    let chatReq = ChatCompletionRequest(model: request.model, messages: mapped, temperature: temperature, max_tokens: maxTokens, stream: false, multi_segment: nil)
+    let chatReq = ChatCompletionRequest(model: request.model, messages: mapped, temperature: temperature, max_tokens: maxTokens, stream: false, multi_segment: nil, tools: nil, tool_choice: nil)
         let resp = try await handleChatCompletion(chatReq)
         let iso = ISO8601DateFormatter()
         let createdAt = iso.string(from: Date(timeIntervalSince1970: TimeInterval(resp.created)))
@@ -391,6 +552,60 @@ final class FoundationModelsService: @unchecked Sendable {
         }
         parts.append("assistant:")
         return parts.joined(separator: "\n")
+    }
+
+    // Build a tool intro system message describing available tools and the JSON envelope to request them
+    private func toolsDescription(_ tools: [OAITool]) -> String {
+        var lines: [String] = []
+        lines.append("You can call tools when helpful. If a tool is needed, reply ONLY with a single JSON line in this exact schema and no extra text:")
+        lines.append("{\"tool_call\": {\"name\": \"<tool-name>\", \"arguments\": { /* args */ } }}")
+        lines.append("")
+        lines.append("Available tools:")
+        for t in tools {
+            if t.type == "function", let f = t.function {
+                let desc = f.description ?? ""
+                lines.append("- \(f.name): \(desc)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // Parse a tool call from model output, expecting a JSON envelope as instructed
+    private func parseToolCall(from text: String) -> (name: String, arguments: JSONValue)? {
+        struct Envelope: Codable { let tool_call: Inner }
+        struct Inner: Codable { let name: String; let arguments: JSONValue }
+        // Try direct decode first
+        if let data = text.data(using: .utf8), let env = try? JSONDecoder().decode(Envelope.self, from: data) {
+            return (env.tool_call.name, env.tool_call.arguments)
+        }
+        // Try to find a JSON object substring
+        if let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}") {
+            let sub = String(text[start...end])
+            if let data = sub.data(using: .utf8), let env = try? JSONDecoder().decode(Envelope.self, from: data) {
+                return (env.tool_call.name, env.tool_call.arguments)
+            }
+        }
+        return nil
+    }
+
+    // Serialize JSONValue to a compact string
+    private func jsonString(_ v: JSONValue) -> String? {
+        func encode(_ v: JSONValue) -> Any {
+            switch v {
+            case .string(let s): return s
+            case .number(let d): return d
+            case .bool(let b): return b
+            case .null: return NSNull()
+            case .object(let o): return o.mapValues { encode($0) }
+            case .array(let a): return a.map { encode($0) }
+            }
+        }
+        let any = encode(v)
+        guard JSONSerialization.isValidJSONObject(any) else { return nil }
+        if let data = try? JSONSerialization.data(withJSONObject: any, options: []) {
+            return String(data: data, encoding: .utf8)
+        }
+        return nil
     }
 
     // Replace this with actual Foundation Models generation when available in your target.
@@ -481,14 +696,6 @@ extension FoundationModelsService {
         logger.log("[chat.multi] basePromptLen=\(basePrompt.count) tokens=\(tokens) segChars=\(segmentChars) maxSeg=\(maxSegments)")
         var soFar = ""
 
-        // Build a compact summary of the base prompt to use on continuation rounds to keep context small
-        // If summarization is unavailable, fall back to clamping head/tail.
-        let baseSummary: String = await summarizeText(basePrompt, targetChars: 800, model: model, temperature: temperature)
-        let maxContextTokens = 4000
-        // Leave extra headroom during multi-round streaming since we can't enforce output tokens on-device
-        let reserveForRoundOutput = 800
-        let roundBudget = max(1200, maxContextTokens - reserveForRoundOutput) // ~3200 tokens budget for input
-
         // Helper to build instructions for each segment
         func instructions(forRound round: Int) -> String {
             var parts: [String] = []
@@ -502,39 +709,18 @@ extension FoundationModelsService {
 
         // First segment uses the full prepared prompt
         for round in 1...maxSegments {
-            // Construct prompt and instructions with adaptive trimming to fit within roundBudget
-            var prompt: String
-            var includeSoFarChars = 1500
+            let prompt: String
             if round == 1 {
                 prompt = basePrompt
             } else {
-                // Use compact summary of the task/context for continuation rounds
-                prompt = "Task/context summary (compressed):\n\(baseSummary)\n\nassistant:"
-            }
-
-            func buildInstructions(_ includeChars: Int) -> String {
-                var parts: [String] = []
-                parts.append("You are a helpful assistant. Continue the answer succinctly and cohesively.")
-                parts.append("Aim for about \(segmentChars) characters in this segment; do not repeat prior content.")
-                if round > 1 {
-                    let tail = String(soFar.suffix(includeChars))
-                    parts.append("So far, you've written the following (do not repeat, only continue):\n\(tail)")
-                }
-                return parts.joined(separator: "\n")
-            }
-
-            var instructionsStr = buildInstructions(includeSoFarChars)
-            // If estimated tokens exceed budget, shrink the included previous-output tail
-            while approxTokenCount(instructionsStr + "\n\n" + prompt) > roundBudget && includeSoFarChars > 200 {
-                includeSoFarChars = max(200, includeSoFarChars / 2)
-                instructionsStr = buildInstructions(includeSoFarChars)
+                prompt = "\(basePrompt)\n\nassistant:"
             }
 
             do {
                 #if canImport(FoundationModels)
                 if #available(iOS 18.0, macOS 15.0, visionOS 2.0, *) {
                     // Create a fresh short-lived session per segment with tailored instructions
-                    let session = LanguageModelSession(instructions: instructionsStr)
+                    let session = LanguageModelSession(instructions: instructions(forRound: round))
                     let response = try await session.respond(to: prompt)
                     let segment = response.content
                     logger.log("[chat.multi] round=\(round) segLen=\(segment.count)")
@@ -543,7 +729,7 @@ extension FoundationModelsService {
                         await emit(segment)
                     }
                 } else {
-                    let segment = try await self.generateText(model: model, prompt: instructionsStr + "\n\n" + prompt, temperature: temperature, maxTokens: nil)
+                    let segment = try await self.generateText(model: model, prompt: instructions(forRound: round) + "\n\n" + prompt, temperature: temperature, maxTokens: nil)
                     logger.log("[chat.multi] round=\(round) segLen=\(segment.count)")
                     if !segment.isEmpty {
                         soFar += segment
@@ -551,7 +737,7 @@ extension FoundationModelsService {
                     }
                 }
                 #else
-                let segment = try await self.generateText(model: model, prompt: instructionsStr + "\n\n" + prompt, temperature: temperature, maxTokens: nil)
+                let segment = try await self.generateText(model: model, prompt: instructions(forRound: round) + "\n\n" + prompt, temperature: temperature, maxTokens: nil)
                 logger.log("[chat.multi] round=\(round) segLen=\(segment.count)")
                 if !segment.isEmpty {
                     soFar += segment
@@ -574,4 +760,100 @@ extension FoundationModelsService {
 }
 
 // (no prompt truncation utilities by design)
+
+
+// MARK: - Tools Registry
+
+private final class ToolsRegistry: @unchecked Sendable {
+    static let shared = ToolsRegistry()
+    private let logger = Logger(subsystem: "com.example.PerspectiveIntelligence", category: "ToolsRegistry")
+
+    // Constrain all file operations to a single root directory.
+    // Set PI_WORKSPACE_ROOT in the environment to point at your workspace; defaults to Documents.
+    private let rootURL: URL
+    private let fm = FileManager.default
+
+    private init() {
+        if let root = ProcessInfo.processInfo.environment["PI_WORKSPACE_ROOT"], !root.isEmpty {
+            self.rootURL = URL(fileURLWithPath: root)
+        } else {
+            self.rootURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        }
+        logger.log("[tools] root=\(self.rootURL.path, privacy: .public)")
+    }
+
+    enum ToolError: Error, LocalizedError {
+        case invalidPath
+        case notFound
+        case ioFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .invalidPath: return "Invalid or out-of-root path"
+            case .notFound: return "Path not found"
+            case .ioFailed(let m): return m
+            }
+        }
+    }
+
+    // Execute a tool by name with JSONValue arguments
+    func execute(name: String, arguments: JSONValue) async throws -> JSONValue {
+        switch name {
+        case "read_file":
+            guard let path = argString(arguments, key: "path") else { return .object(["error": .string("Missing 'path'")]) }
+            let maxBytes = argInt(arguments, key: "max_bytes") ?? 256 * 1024
+            let url = try resolvePath(path)
+            guard fm.fileExists(atPath: url.path) else { throw ToolError.notFound }
+            let data = try Data(contentsOf: url)
+            let slice = data.prefix(maxBytes)
+            let text = String(decoding: slice, as: UTF8.self)
+            return .object(["path": .string(path), "content": .string(text), "truncated": .bool(slice.count < data.count)])
+        case "write_file":
+            guard let path = argString(arguments, key: "path") else { return .object(["error": .string("Missing 'path'")]) }
+            let content = argString(arguments, key: "content") ?? ""
+            let url = try resolvePath(path)
+            do {
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try content.data(using: .utf8)?.write(to: url, options: .atomic)
+            } catch {
+                throw ToolError.ioFailed(String(describing: error))
+            }
+            return .object(["path": .string(path), "written_bytes": .number(Double(content.utf8.count))])
+        case "list_dir":
+            guard let path = argString(arguments, key: "path") else { return .object(["error": .string("Missing 'path'")]) }
+            let url = try resolvePath(path)
+            do {
+                let items = try fm.contentsOfDirectory(atPath: url.path)
+                return .object(["path": .string(path), "items": .array(items.map { .string($0) })])
+            } catch {
+                throw ToolError.ioFailed(String(describing: error))
+            }
+        default:
+            return .object(["error": .string("Unknown tool: \(name)")])
+        }
+    }
+
+    // Helpers
+    private func resolvePath(_ relative: String) throws -> URL {
+        let candidate = rootURL.appendingPathComponent(relative)
+        let standardized = candidate.standardized
+        // Prevent escaping from root
+        guard standardized.path.hasPrefix(rootURL.standardized.path) else { throw ToolError.invalidPath }
+        return standardized
+    }
+
+    private func argString(_ args: JSONValue, key: String) -> String? {
+        if case .object(let dict) = args, case .string(let s)? = dict[key] { return s }
+        return nil
+    }
+    private func argInt(_ args: JSONValue, key: String) -> Int? {
+        if case .object(let dict) = args, let v = dict[key] {
+            switch v {
+            case .number(let d): return Int(d)
+            case .string(let s): return Int(s)
+            default: return nil
+            }
+        }
+        return nil
+    }
+}
 

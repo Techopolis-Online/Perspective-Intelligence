@@ -1,0 +1,27 @@
+name: Discord Commit Notification
+
+on:
+  push:  # Triggers on all branches now
+
+jobs:
+  discord-notification:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for proper commit info
+      
+      - name: Discord Webhook
+        uses: johnnyhuy/actions-discord-git-webhook@main
+        with:
+          # Replace this with your actual Discord webhook URL when ready
+          # You can set this up as a repository secret named DISCORD_WEBHOOK_URL
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Optional customizations:
+          repo_name: "Perspective at"  # Custom repository name
+          color: "#FFFF00"  # Color of the Discord embed (yellow in hexadecimal)
+          hide_links: false  # Set to true if you want to hide links
+          message_title: "New commit in at"  # Custom title without emojis
+          include_emojis: false  # Disable emojis in the message
+          message_format: "{full_name} - {message}"  # Clean format with full username and message

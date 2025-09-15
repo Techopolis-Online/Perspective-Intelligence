@@ -85,7 +85,7 @@ final class ChatViewModel: ObservableObject {
             mapped.append(.init(role: lastUser.role.rawValue, content: lastUser.content))
         }
         // Fixed model (non-configurable)
-        let reqBody = ChatCompletionRequest(model: "apple.local", messages: mapped, temperature: temperature, max_tokens: nil, stream: false)
+    let reqBody = ChatCompletionRequest(model: "apple.local", messages: mapped, temperature: temperature, max_tokens: nil, stream: false, multi_segment: nil)
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

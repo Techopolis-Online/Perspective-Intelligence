@@ -102,7 +102,7 @@ struct ServerStatusView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 90)
             }
-            Text("OpenAI-compatible endpoints:\nPOST /v1/chat/completions")
+            Text("OpenAI-compatible endpoints:\nPOST /v1/chat/completions\nPOST /v1/completions\nPOST /api/generate\nGET /v1/models\nGET /v1/models/{id}\nGET /api/models\nGET /api/models/{id}\nGET /api/tags\nGET /api/version\nGET /api/ps\nPOST /api/chat")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
